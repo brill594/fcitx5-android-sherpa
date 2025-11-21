@@ -7,6 +7,10 @@ package org.fcitx.fcitx5.android.input
 
 import android.annotation.SuppressLint
 import android.app.Dialog
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Color
@@ -29,6 +33,7 @@ import android.view.inputmethod.InlineSuggestionsRequest
 import android.view.inputmethod.InlineSuggestionsResponse
 import android.view.inputmethod.InputMethodSubtype
 import android.widget.FrameLayout
+import android.widget.Toast
 import android.widget.inline.InlinePresentationSpec
 import androidx.annotation.Keep
 import androidx.annotation.RequiresApi
@@ -64,6 +69,8 @@ import org.fcitx.fcitx5.android.data.theme.Theme
 import org.fcitx.fcitx5.android.data.theme.ThemeManager
 import org.fcitx.fcitx5.android.input.cursor.CursorRange
 import org.fcitx.fcitx5.android.input.cursor.CursorTracker
+import org.fcitx.fcitx5.android.input.voice.VoiceInputController
+import org.fcitx.fcitx5.android.input.voice.VoicePermissionActivity
 import org.fcitx.fcitx5.android.utils.InputMethodUtil
 import org.fcitx.fcitx5.android.utils.alpha
 import org.fcitx.fcitx5.android.utils.forceShowSelf
@@ -125,6 +132,52 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
 
     private var highlightColor: Int = 0x66008577 // material_deep_teal_500 with alpha 0.4
 
+    private var voiceInputController: VoiceInputController? = null
+    private val voiceCallback = object : VoiceInputController.Callback {
+        override fun onPartialResult(text: String) {
+            if (text.isBlank()) return
+            currentInputConnection?.setComposingText(text, 1)
+        }
+
+        override fun onFinalResult(text: String) {
+            if (text.isBlank()) return
+            val ic = currentInputConnection ?: return
+            resetComposingState()
+            ic.withBatchEdit {
+                finishComposingText()
+                commitText(text, 1)
+            }
+        }
+
+        override fun onPermissionDenied() {
+            requestVoicePermission()
+        }
+
+        override fun onError(throwable: Throwable) {
+            Timber.e(throwable, "Voice input error")
+            Toast.makeText(
+                this@FcitxInputMethodService,
+                "Voice input unavailable",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+    private val voicePermissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != VoicePermissionActivity.ACTION_RESULT) return
+            val granted = intent.getBooleanExtra(VoicePermissionActivity.EXTRA_GRANTED, false)
+            if (granted) {
+                ensureVoiceController().startVoiceInputIfAvailable()
+            } else {
+                Toast.makeText(
+                    this@FcitxInputMethodService,
+                    "Microphone permission is required for voice input",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
     private val prefs = AppPrefs.getInstance()
     private val inlineSuggestions by prefs.keyboard.inlineSuggestions
     private val ignoreSystemCursor by prefs.advanced.ignoreSystemCursor
@@ -160,6 +213,34 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
         navbarMgr.evaluate(window.window!!)
         replaceInputView(theme)
         replaceCandidateView(theme)
+    }
+
+    private fun ensureVoiceController(): VoiceInputController {
+        return voiceInputController ?: VoiceInputController(this, voiceCallback).also {
+            voiceInputController = it
+        }
+    }
+
+    fun startVoiceInput() {
+        val started = ensureVoiceController().startVoiceInputIfAvailable()
+        if (!started) {
+            requestVoicePermission()
+        }
+    }
+
+    fun stopVoiceInput() {
+        voiceInputController?.stopVoiceInput()
+    }
+
+    private fun releaseVoiceInput() {
+        voiceInputController?.stopVoiceInput()
+        voiceInputController = null
+    }
+
+    private fun requestVoicePermission() {
+        val intent = Intent(this, VoicePermissionActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        startActivity(intent)
     }
 
     @Keep
@@ -212,6 +293,19 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
             postFcitxJob {
                 SubtypeManager.syncWith(enabledIme())
             }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(
+                voicePermissionReceiver,
+                IntentFilter(VoicePermissionActivity.ACTION_RESULT),
+                Context.RECEIVER_NOT_EXPORTED
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(
+                voicePermissionReceiver,
+                IntentFilter(VoicePermissionActivity.ACTION_RESULT)
+            )
         }
         super.onCreate()
         decorView = window.window!!.decorView
@@ -1003,6 +1097,7 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
 
     override fun onFinishInputView(finishingInput: Boolean) {
         Timber.d("onFinishInputView: finishingInput=$finishingInput")
+        stopVoiceInput()
         decorLocationUpdated = false
         inputDeviceMgr.onFinishInputView()
         currentInputConnection?.apply {
@@ -1018,6 +1113,7 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
 
     override fun onFinishInput() {
         Timber.d("onFinishInput")
+        stopVoiceInput()
         postFcitxJob {
             focus(false)
         }
@@ -1042,6 +1138,12 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
         }
         prefs.candidates.unregisterOnChangeListener(recreateCandidatesViewListener)
         ThemeManager.removeOnChangedListener(onThemeChangeListener)
+        try {
+            unregisterReceiver(voicePermissionReceiver)
+        } catch (_: IllegalArgumentException) {
+            // already unregistered
+        }
+        releaseVoiceInput()
         super.onDestroy()
         // Fcitx might be used in super.onDestroy()
         FcitxDaemon.disconnect(javaClass.name)
